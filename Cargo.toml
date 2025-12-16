@@ -1,0 +1,22 @@
+[package]
+name = "genesis"
+version = "0.1.0"
+edition = "2024"
+description = "Genesis tooling: validate, blob+sign, verify, import, and auditor reports."
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.4", features = ["derive"] }
+hex = "0.4"
+k256 = { version = "0.12", features = ["ecdsa"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+jsonschema = "0.21"
+bs58 = "0.4"
+## NOTE: avoid pre-release crypto deps in regulator tooling.
+## `ripemd` 0.1.x is the latest stable series on crates.io.
+ripemd = "0.1"
