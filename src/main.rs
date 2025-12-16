@@ -62,10 +62,22 @@ struct Args {
     /// Human-readable audit report for a contract (.json) or blob (.blob).
     #[arg(long = "report", value_name = "FILE")]
     report: Option<PathBuf>,
+
+    /// Economics audit report (PASS/FAIL invariants) for a contract (.json) or blob (.blob).
+    #[arg(long = "economics-audit", value_name = "FILE")]
+    economics_audit: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(path) = &args.economics_audit {
+        let sig_path = args.sig.clone();
+        let report =
+            genesis::render_economics_audit_report(path, Some(&args.schema), sig_path.as_deref())?;
+        println!("{report}");
+        return Ok(());
+    }
 
     if let Some(path) = &args.report {
         let sig_path = args.sig.clone();

@@ -5,6 +5,8 @@ In Solidarity with Ukraine's Defenders
 
 A comprehensive monochain mainnet/beta configuration for the STELS (Smart Transaction Event Ledger System) platform, featuring advanced consensus mechanisms, smart contract capabilities, and enterprise-grade security.
 
+`SLI` (Stels Liq Index) is the **native utility coin of the STELS network** (fees, staking/economic security, and protocol incentives). The Genesis contract also includes the disclosure `token_is_not_equity = true`.
+
 ### Regulatory Review Package (Genesis)
 
 This repository contains tooling and artifacts for reviewing a **Genesis contract** and its **signed binary package**.
@@ -31,6 +33,12 @@ All regulator-facing artifacts are in:
 - `src/genesis/genesis.blob` — Binary blob packaging the contract + schema
 - `src/genesis/genesis.sig.json` — Blob signature file (k-of-n threshold)
 - `src/schemes/genesis-smart-1.0.json` — JSON Schema used for validation
+
+### Documentation (Regulator-facing)
+
+- `INFORMATION.md` — Short regulator-facing network/technology overview
+- `WHITEPAPER.md` — Technical overview derived from Genesis artifacts
+- `ECONOMICS.md` — Monetary & economic policy (regulator-facing)
 
 ### One-command Audit Report (Human-readable)
 
@@ -72,6 +80,20 @@ Verify the blob package (parsing safety checks + JSON validity + schema validati
 cargo run -- --verify-blob src/genesis/genesis.blob
 ```
 
+### Economics Audit (PASS/FAIL invariants)
+
+Run the economics invariant audit over the signed blob package (recommended):
+
+```bash
+cargo run -- --economics-audit src/genesis/genesis.blob
+```
+
+Or run it over the raw contract JSON:
+
+```bash
+cargo run -- --economics-audit src/genesis/genesis.json
+```
+
 ### What Is Verified
 
 When reporting/verifying a blob (`.blob`) using the provided CLI:
@@ -101,4 +123,10 @@ Build and run:
 
 ```bash
 cargo build
+```
+
+Generate and open API docs:
+
+```bash
+cargo doc --no-deps --open
 ```

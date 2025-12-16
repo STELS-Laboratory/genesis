@@ -812,6 +812,508 @@ pub fn render_audit_report(
     }
 }
 
+/// Render an economics audit report (Markdown) for a `.json` contract or `.blob` package.
+///
+/// This is a **PASS/FAIL invariant audit** intended for regulator review. It checks, among others:
+/// - minting policy is disabled
+/// - supply cap is >= genesis circulating supply (sum of balances)
+/// - fee distribution bps sum equals `total_bps` and `10000`
+/// - rewards invariants (e.g. `max_per_epoch == rate_per_unit * global_ops_cap_per_epoch`)
+/// - consistency of key economic addresses (treasury/insurance)
+pub fn render_economics_audit_report(
+    input_path: &Path,
+    schema_path: Option<&Path>,
+    sig_path: Option<&Path>,
+) -> Result<String> {
+    match input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+    {
+        "blob" => {
+            let sig = sig_path
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| default_sig_out(input_path));
+            render_economics_audit_report_from_blob(input_path, &sig)
+        }
+        "json" => {
+            let schema =
+                schema_path.ok_or_else(|| anyhow!("schema_path is required for .json audit"))?;
+            render_economics_audit_report_from_json(input_path, schema)
+        }
+        other => bail!("unsupported file type '{}'; expected .json or .blob", other),
+    }
+}
+
+fn audit_check_row(name: &str, ok: bool, detail: &str) -> String {
+    format!(
+        "- **{}**: {} — {}\n",
+        name,
+        if ok { "PASS" } else { "FAIL" },
+        detail
+    )
+}
+
+fn compute_genesis_circulating_supply(doc: &Value) -> Result<u128> {
+    let accounts = doc
+        .pointer("/state/accounts")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("missing/invalid state.accounts array"))?;
+    let mut sum: u128 = 0;
+    for (i, acct) in accounts.iter().enumerate() {
+        let bal_str = acct
+            .get("balance")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("missing/invalid state.accounts[{}].balance", i))?;
+        if bal_str.is_empty() || !bal_str.chars().all(|c| c.is_ascii_digit()) {
+            bail!(
+                "state.accounts[{}].balance must be decimal string, got '{}'",
+                i,
+                bal_str
+            );
+        }
+        let bal = bal_str
+            .parse::<u128>()
+            .with_context(|| format!("failed to parse balance '{}' as u128", bal_str))?;
+        sum = sum
+            .checked_add(bal)
+            .ok_or_else(|| anyhow!("circulating supply overflow"))?;
+    }
+    Ok(sum)
+}
+
+fn render_economics_audit_report_from_json(doc_path: &Path, schema_path: &Path) -> Result<String> {
+    let doc_bytes =
+        fs::read(doc_path).with_context(|| format!("failed to read {}", doc_path.display()))?;
+    let doc_value: Value =
+        serde_json::from_slice(&doc_bytes).context("document is not valid JSON")?;
+
+    // Ensure schema-valid (for regulator audit, the contract must validate).
+    let schema_bytes = fs::read(schema_path)
+        .with_context(|| format!("failed to read {}", schema_path.display()))?;
+    let schema_value: Value =
+        serde_json::from_slice(&schema_bytes).context("schema is not valid JSON")?;
+    let validator = validator_for(&schema_value).context("failed to compile JSON Schema")?;
+    if let Err(errors) = validator.validate(&doc_value) {
+        let mut msg = String::new();
+        msg.push_str("Economics audit aborted: schema validation FAILED.\n");
+        let mut count = 0;
+        for e in errors {
+            count += 1;
+            msg.push_str(&format!(
+                "- {} (instance: {}, schema: {})\n",
+                e, e.instance_path, e.schema_path
+            ));
+            if count >= 25 {
+                msg.push_str("- ... (truncated)\n");
+                break;
+            }
+        }
+        bail!(msg);
+    }
+
+    Ok(render_economics_checks(
+        &doc_value,
+        Some(doc_path),
+        Some(schema_path),
+    ))
+}
+
+fn render_economics_audit_report_from_blob(blob_path: &Path, sig_path: &Path) -> Result<String> {
+    // We reuse the safety properties: parse blob and validate embedded schema/document.
+    let blob_bytes = fs::read(blob_path)
+        .with_context(|| format!("failed to read blob {}", blob_path.display()))?;
+    let parts = parse_blob(&blob_bytes)?;
+    let schema_value: Value =
+        serde_json::from_slice(&parts.schema_bytes).context("schema in blob is not valid JSON")?;
+    let doc_value: Value = serde_json::from_slice(&parts.document_bytes)
+        .context("document in blob is not valid JSON")?;
+
+    let validator =
+        validator_for(&schema_value).context("failed to compile JSON Schema from blob")?;
+    if let Err(errors) = validator.validate(&doc_value) {
+        let mut msg = String::new();
+        msg.push_str("Economics audit aborted: embedded schema validation FAILED.\n");
+        let mut count = 0;
+        for e in errors {
+            count += 1;
+            msg.push_str(&format!(
+                "- {} (instance: {}, schema: {})\n",
+                e, e.instance_path, e.schema_path
+            ));
+            if count >= 25 {
+                msg.push_str("- ... (truncated)\n");
+                break;
+            }
+        }
+        bail!(msg);
+    }
+
+    // Also ensure the blob package is cryptographically consistent for regulators.
+    // (This is a strong prerequisite before using the embedded contract for audit.)
+    verify_blob_and_signatures(blob_path, sig_path)?;
+
+    Ok(render_economics_checks(&doc_value, None, None))
+}
+
+fn render_economics_checks(
+    doc: &Value,
+    doc_path: Option<&Path>,
+    schema_path: Option<&Path>,
+) -> String {
+    // Extract key values.
+    let symbol = doc
+        .pointer("/parameters/currency/symbol")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing>");
+    let decimals = doc
+        .pointer("/parameters/currency/decimals")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX);
+
+    let supply_cap = doc
+        .pointer("/monetary/supply_cap")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing>");
+    let minting = doc
+        .pointer("/monetary/minting")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing>");
+
+    // Supply and circulating.
+    let circulating_res = compute_genesis_circulating_supply(doc);
+    let circulating_val = circulating_res.as_ref().ok().copied();
+    let supply_cap_u128 = supply_cap.parse::<u128>().ok();
+
+    // Fees.
+    let fees_base = doc
+        .pointer("/parameters/fees/base")
+        .and_then(|v| v.as_u64());
+    let fees_per_byte = doc
+        .pointer("/parameters/fees/per_byte")
+        .and_then(|v| v.as_u64());
+    let tx_min_fee = doc.pointer("/tx_rules/min_fee").and_then(|v| v.as_u64());
+
+    // Fee distribution.
+    let total_bps = doc
+        .pointer("/monetary/fee_distribution/total_bps")
+        .and_then(|v| v.as_u64());
+    let validators_bps = doc
+        .pointer("/monetary/fee_distribution/validators_bps")
+        .and_then(|v| v.as_u64());
+    let workers_bps = doc
+        .pointer("/monetary/fee_distribution/workers_bps")
+        .and_then(|v| v.as_u64());
+    let treasury_bps = doc
+        .pointer("/monetary/fee_distribution/treasury_bps")
+        .and_then(|v| v.as_u64());
+    let insurance_bps = doc
+        .pointer("/monetary/fee_distribution/insurance_bps")
+        .and_then(|v| v.as_u64());
+    let burn_bps = doc
+        .pointer("/monetary/fee_distribution/burn_bps")
+        .and_then(|v| v.as_u64());
+
+    // Rewards invariants.
+    let rate_per_unit = doc
+        .pointer("/monetary/rewards/rate_per_unit")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok());
+    let max_per_epoch = doc
+        .pointer("/monetary/rewards/max_per_epoch")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok());
+    let global_ops_cap = doc
+        .pointer("/monetary/rewards/caps/global_ops_cap_per_epoch")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u128);
+
+    // Treasury pool caps.
+    let reward_pool_initial = doc
+        .pointer("/monetary/treasury_policy/reward_pool_initial")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok());
+    let reward_cap_total = doc
+        .pointer("/monetary/treasury_policy/reward_cap_total")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok());
+    let reward_cap_per_year = doc
+        .pointer("/monetary/treasury_policy/reward_cap_per_year")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok());
+    let reward_cap_per_epoch = doc
+        .pointer("/monetary/treasury_policy/reward_cap_per_epoch")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok());
+    let accounting = doc
+        .pointer("/monetary/treasury_policy/accounting")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing>");
+
+    // Addresses consistency.
+    let treasury_addr_params = doc
+        .pointer("/parameters/treasury_address")
+        .and_then(|v| v.as_str());
+    let treasury_addr_dist = doc
+        .pointer("/monetary/fee_distribution/distribution_addresses/treasury_address")
+        .and_then(|v| v.as_str());
+    let insurance_addr_dist = doc
+        .pointer("/monetary/fee_distribution/distribution_addresses/insurance_address")
+        .and_then(|v| v.as_str());
+
+    // Staking min stake alignment.
+    let min_stake_consensus = doc
+        .pointer("/consensus/notary_registry/min_stake")
+        .and_then(|v| v.as_u64());
+    let min_stake_rewards = doc
+        .pointer("/monetary/rewards/staking/min_stake")
+        .and_then(|v| v.as_u64());
+
+    let mut out = String::new();
+    out.push_str("## Economics audit report (Genesis)\n\n");
+    if let Some(p) = doc_path {
+        out.push_str(&format!("- **contract**: `{}`\n", p.display()));
+    } else {
+        out.push_str("- **contract**: (embedded in verified blob)\n");
+    }
+    if let Some(p) = schema_path {
+        out.push_str(&format!("- **schema**: `{}`\n", p.display()));
+    }
+    out.push_str("\n### A) Currency & denomination\n");
+    out.push_str(&audit_check_row(
+        "Native utility coin",
+        symbol == "SLI",
+        &format!("parameters.currency.symbol = `{}` (expected `SLI`)", symbol),
+    ));
+    out.push_str(&audit_check_row(
+        "Decimals",
+        decimals == 8,
+        &format!("parameters.currency.decimals = `{}` (expected 8)", decimals),
+    ));
+
+    out.push_str("\n### B) Supply model\n");
+    out.push_str(&audit_check_row(
+        "Minting disabled",
+        minting == "disabled",
+        &format!("monetary.minting = `{}` (expected `disabled`)", minting),
+    ));
+    match (circulating_val, supply_cap_u128) {
+        (Some(circ), Some(cap)) => {
+            out.push_str(&audit_check_row(
+                "Supply cap >= circulating (genesis balances)",
+                cap >= circ,
+                &format!("supply_cap = {}, circulating = {}", cap, circ),
+            ));
+        }
+        (Some(circ), None) => {
+            out.push_str(&audit_check_row(
+                "Supply cap parseable",
+                false,
+                &format!(
+                    "monetary.supply_cap = '{}' (cannot parse), circulating = {}",
+                    supply_cap, circ
+                ),
+            ));
+        }
+        (None, _) => {
+            out.push_str(&audit_check_row(
+                "Circulating supply computable",
+                false,
+                &format!(
+                    "failed to sum state.accounts[*].balance: {}",
+                    circulating_res
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string())
+                ),
+            ));
+        }
+    }
+
+    out.push_str("\n### C) Fees\n");
+    out.push_str(&audit_check_row(
+        "Fees currency symbol",
+        doc.pointer("/parameters/fees/currency")
+            .and_then(|v| v.as_str())
+            == Some("SLI"),
+        &format!(
+            "parameters.fees.currency = `{}`",
+            doc.pointer("/parameters/fees/currency")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>")
+        ),
+    ));
+    out.push_str(&audit_check_row(
+        "Min fee aligned with base fee",
+        fees_base.is_some() && tx_min_fee.is_some() && fees_base == tx_min_fee,
+        &format!(
+            "fees.base = {:?}, tx_rules.min_fee = {:?}",
+            fees_base, tx_min_fee
+        ),
+    ));
+    out.push_str(&audit_check_row(
+        "Fee parameters present",
+        fees_base.is_some() && fees_per_byte.is_some(),
+        &format!(
+            "fees.base = {:?}, fees.per_byte = {:?}",
+            fees_base, fees_per_byte
+        ),
+    ));
+
+    out.push_str("\n### D) Fee distribution\n");
+    let bps_sum = validators_bps.unwrap_or(0)
+        + workers_bps.unwrap_or(0)
+        + treasury_bps.unwrap_or(0)
+        + insurance_bps.unwrap_or(0)
+        + burn_bps.unwrap_or(0);
+    out.push_str(&audit_check_row(
+        "BPS sum equals total_bps",
+        total_bps.is_some() && bps_sum == total_bps.unwrap_or(0),
+        &format!(
+            "sum = {}, total_bps = {:?} (validators/workers/treasury/insurance/burn = {:?}/{:?}/{:?}/{:?}/{:?})",
+            bps_sum, total_bps, validators_bps, workers_bps, treasury_bps, insurance_bps, burn_bps
+        ),
+    ));
+    out.push_str(&audit_check_row(
+        "BPS sum equals 10000",
+        bps_sum == 10_000,
+        &format!("sum = {} (expected 10000)", bps_sum),
+    ));
+    out.push_str(&audit_check_row(
+        "Treasury address consistent",
+        treasury_addr_params.is_some() && treasury_addr_params == treasury_addr_dist,
+        &format!(
+            "parameters.treasury_address = {:?}, fee_distribution.treasury_address = {:?}",
+            treasury_addr_params, treasury_addr_dist
+        ),
+    ));
+    out.push_str(&audit_check_row(
+        "Insurance address present",
+        insurance_addr_dist.is_some(),
+        &format!(
+            "fee_distribution.insurance_address = {:?}",
+            insurance_addr_dist
+        ),
+    ));
+
+    out.push_str("\n### E) Rewards (execution-mining)\n");
+    let rewards_mode = doc
+        .pointer("/monetary/rewards/mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing>");
+    out.push_str(&audit_check_row(
+        "Rewards mode set",
+        rewards_mode == "execution-mining",
+        &format!(
+            "monetary.rewards.mode = `{}` (expected `execution-mining`)",
+            rewards_mode
+        ),
+    ));
+    let rewards_source = doc
+        .pointer("/monetary/rewards/source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<missing>");
+    out.push_str(&audit_check_row(
+        "Rewards source treasury",
+        rewards_source == "treasury",
+        &format!(
+            "monetary.rewards.source = `{}` (expected `treasury`)",
+            rewards_source
+        ),
+    ));
+    let invariant_ok = match (rate_per_unit, max_per_epoch, global_ops_cap) {
+        (Some(r), Some(m), Some(c)) => m == r.saturating_mul(c),
+        _ => false,
+    };
+    out.push_str(&audit_check_row(
+        "Rewards invariant max_per_epoch == rate_per_unit * global_ops_cap",
+        invariant_ok,
+        &format!(
+            "rate_per_unit = {:?}, global_ops_cap = {:?}, max_per_epoch = {:?}",
+            rate_per_unit, global_ops_cap, max_per_epoch
+        ),
+    ));
+
+    out.push_str("\n### F) Treasury reserve caps\n");
+    out.push_str(&audit_check_row(
+        "Treasury accounting is decrement-only",
+        accounting == "decrement-only",
+        &format!("treasury_policy.accounting = `{}`", accounting),
+    ));
+    out.push_str(&audit_check_row(
+        "reward_pool_initial == reward_cap_total",
+        reward_pool_initial.is_some()
+            && reward_cap_total.is_some()
+            && reward_pool_initial == reward_cap_total,
+        &format!(
+            "reward_pool_initial = {:?}, reward_cap_total = {:?}",
+            reward_pool_initial, reward_cap_total
+        ),
+    ));
+    out.push_str(&audit_check_row(
+        "reward_cap_per_year <= reward_cap_total",
+        reward_cap_per_year.is_some()
+            && reward_cap_total.is_some()
+            && reward_cap_per_year.unwrap_or(0) <= reward_cap_total.unwrap_or(0),
+        &format!(
+            "reward_cap_per_year = {:?}, reward_cap_total = {:?}",
+            reward_cap_per_year, reward_cap_total
+        ),
+    ));
+    out.push_str(&audit_check_row(
+        "reward_cap_per_epoch <= reward_cap_per_year",
+        reward_cap_per_epoch.is_some()
+            && reward_cap_per_year.is_some()
+            && reward_cap_per_epoch.unwrap_or(0) <= reward_cap_per_year.unwrap_or(0),
+        &format!(
+            "reward_cap_per_epoch = {:?}, reward_cap_per_year = {:?}",
+            reward_cap_per_epoch, reward_cap_per_year
+        ),
+    ));
+
+    out.push_str("\n### G) Staking alignment\n");
+    out.push_str(&audit_check_row(
+        "min_stake aligned (consensus vs rewards)",
+        min_stake_consensus.is_some()
+            && min_stake_rewards.is_some()
+            && min_stake_consensus == min_stake_rewards,
+        &format!(
+            "consensus.min_stake = {:?}, rewards.min_stake = {:?}",
+            min_stake_consensus, min_stake_rewards
+        ),
+    ));
+
+    // Overall
+    let mut all_ok = true;
+    // Minimal overall gate: minting disabled, bps sum correct, treasury accounting correct, cap>=circ, invariant ok.
+    if minting != "disabled" {
+        all_ok = false;
+    }
+    if bps_sum != 10_000 {
+        all_ok = false;
+    }
+    if accounting != "decrement-only" {
+        all_ok = false;
+    }
+    if let (Some(circ), Some(cap)) = (circulating_val, supply_cap_u128) {
+        if cap < circ {
+            all_ok = false;
+        }
+    } else {
+        all_ok = false;
+    }
+    if !invariant_ok {
+        all_ok = false;
+    }
+
+    out.push_str("\n### Overall\n");
+    out.push_str(&format!(
+        "- **economics_audit_status**: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    ));
+    out
+}
+
 fn render_json_audit_report(doc_path: &Path, schema_path: &Path) -> Result<String> {
     let doc_bytes =
         fs::read(doc_path).with_context(|| format!("failed to read {}", doc_path.display()))?;

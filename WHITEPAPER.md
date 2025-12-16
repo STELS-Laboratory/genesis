@@ -31,6 +31,8 @@ The STELS network is bootstrapped by a Genesis contract that defines:
 - Governance controls (upgrade, emergency pause, revocation list)
 - Compliance and audit logging constraints
 
+`SLI` (Stels Liq Index) is the **native utility coin of the STELS network**, used for transaction fees, staking/economic security, and protocol incentives (as encoded by the Genesis contract). The Genesis contract also includes the disclosure `token_is_not_equity = true`.
+
 The regulator/auditor package is delivered as:
 - a schema-validated JSON contract (`genesis.json`),
 - a deterministic binary blob (`genesis.blob`) containing the exact bytes of `{contract, schema}`,
