@@ -374,9 +374,66 @@ Audit logging channels:
 
 ---
 
-## 13) Regulator verification procedure (reproducible)
+## 13) Blob format and initial transaction chain
 
-### 13.1 Human-readable report
+### 13.1 Extended Blob Format (Version 3)
+
+The extended blob format organizes content into distinct sections for better structure and extensibility:
+
+**Format Structure:**
+- Magic bytes (16 bytes): `GENESIS-BLOB\0\0\0\0`
+- Version (4 bytes, big-endian): `3`
+- Sections (each section):
+  - Section type (2 bytes, big-endian): `0x0001` (SCHEMA), `0x0002` (GENESIS_DOCUMENT), `0x0003` (INITIAL_TX_STATE), `0x0004` (SIGNATURE_SET)
+  - Section length (8 bytes, big-endian): length of section data
+  - Section data: raw bytes
+
+**Section Types:**
+- `SECTION_SCHEMA` (0x0001): JSON Schema bytes (required)
+- `SECTION_GENESIS_DOCUMENT` (0x0002): Genesis contract JSON bytes (required)
+- `SECTION_INITIAL_TX_STATE` (0x0003): Initial transactions JSON array (optional)
+- `SECTION_SIGNATURE_SET` (0x0004): Signature set JSON (optional, can be detached or embedded)
+
+**Signature Verification:**
+For extended blobs with embedded signatures, signatures are computed over the blob **without** the SIGNATURE_SET section. This ensures signatures are over content, not over themselves. The signature file always contains metadata for the blob without embedded signatures.
+
+### 13.2 Initial Transaction Chain Protocol
+
+The initial transaction chain establishes the network's starting state:
+
+1. **Genesis Funding Transaction**: 
+   - Treasury receives its full initial balance
+   - `prev_hash` points to `genesis.id` (extracted from `genesis.id` field)
+   - This is the first transaction in the chain
+
+2. **Distribution Transactions**:
+   - Treasury distributes funds to other accounts
+   - Each transaction chains to the previous using `prev_hash`
+   - Equal distribution per recipient
+
+3. **Staking Transactions**:
+   - All accounts with initial stake activate staking
+   - Includes treasury if it has stake
+   - Transactions chain sequentially
+
+4. **Nomination Transactions**:
+   - All initial committee members register as nominators
+   - Transactions chain sequentially after staking transactions
+
+**Transaction Signing:**
+- All transactions are signed with all provided signing keys
+- Signing domain: `["STELS-TX", ...]` from `protocol.sign_domains.tx`
+- Signatures are normalized to low-S for canonicalization
+- Transaction hash excludes signatures (canonical form)
+
+**Fee Calculation:**
+- Formula: `base + per_byte * tx_bytes + per_op * num_ops`
+- Fees are calculated after transaction construction
+- Fees are included in transaction hash calculation
+
+## 14) Regulator verification procedure (reproducible)
+
+### 14.1 Human-readable report
 
 ```bash
 cargo run -- --report src/genesis/genesis.blob
@@ -387,6 +444,20 @@ Expected:
 - `integrity_checks: OK`
 - `signatures_ok: OK`
 - `ready_for_regulator: YES`
+
+### 14.2 Verify initial transactions
+
+```bash
+cargo run -- --verify-initial-transactions src/genesis/genesis.blob
+```
+
+This verifies:
+- Transaction chain integrity (prev_hash links)
+- Genesis funding transaction correctness
+- Distribution completeness
+- Staking and nomination coverage
+- Fee calculation accuracy
+- Signature validity
 
 ### 13.2 Strict verification
 

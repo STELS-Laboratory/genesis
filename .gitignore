@@ -1,2 +1,4 @@
 /target
-.private_key.*
+*.key
+.DS_Store
+**/.DS_Store

@@ -11,10 +11,13 @@ This repository contains the **canonical Genesis configuration** for the STELS n
 - **Genesis contract (JSON)**: `src/genesis/genesis.json`
 - **JSON Schema**: `src/schemes/genesis-smart-1.0.json`
 - **Deterministic signed package**:
-  - `src/genesis/genesis.blob` — binary blob containing the exact bytes of `{genesis.json, schema.json}`
-  - `src/genesis/genesis.sig.json` — signature manifest that signs `SHA256(blob)` using **ECDSA secp256k1** with a **k-of-n** threshold
+  - `src/genesis/genesis.blob` — all-in-one binary blob containing:
+    - Genesis contract JSON bytes
+    - JSON Schema bytes
+    - Initial transactions (distribution, staking, nomination) with `fee = 0`
+    - Embedded signatures (ECDSA secp256k1 with **k-of-n** threshold)
 
-The package is designed so an independent reviewer can verify **integrity, authenticity (threshold signatures), and schema correctness** without any private keys.
+The package is designed so an independent reviewer can verify **integrity, authenticity (threshold signatures), and schema correctness** without any private keys. The blob is self-contained; no separate signature file is needed (default behavior).
 
 ### 2) Network identity (as defined by Genesis)
 From `src/genesis/genesis.json`:
@@ -24,7 +27,7 @@ From `src/genesis/genesis.json`:
 
 ### 3) Core technologies (high level)
 - **Contract-as-configuration**: critical parameters are declared in a signed Genesis contract (JSON) and validated against a published schema.
-- **Deterministic packaging**: the signed `.blob` bundles the *exact bytes* of the contract + schema to prevent “schema drift” or ambiguous encodings.
+- **Deterministic packaging**: the signed `.blob` bundles the *exact bytes* of the contract + schema + initial transactions + signatures to prevent "schema drift" or ambiguous encodings.
 - **Cryptography**:
   - **Hashing**: SHA-256 for content and package integrity.
   - **Signing**: ECDSA secp256k1 (DER signatures; low-S canonicalization required).
@@ -62,13 +65,16 @@ Economics invariant audit (PASS/FAIL checks over the verified blob):
 cargo run -- --economics-audit src/genesis/genesis.blob
 ```
 
-If only the JSON is available, validate it against the schema:
+Create a signed blob with initial transactions:
 
 ```bash
-cargo run -- --validate src/genesis/genesis.json
+cargo run -- --create-blob src/genesis/genesis.json
 ```
+
+This command validates the document, generates initial transactions (fee = 0), and creates a signed blob with embedded signatures.
 
 ### 7) Notes / reviewer expectations
 - Private keys are **not** part of this package.
-- The `.blob` + `.sig.json` pair is the primary regulator/auditor artifact for integrity + threshold signature verification.
-- The tool verifies **blob signatures**; the contract may also contain an internal `signatures` section which is a protocol-level concept that requires canonical signing rules to evaluate.
+- The `.blob` file is the primary regulator/auditor artifact. It contains embedded signatures (default), making it self-contained and ready for network bootstrap.
+- Initial transactions have `fee = 0` to preserve distribution economics.
+- The tool verifies **blob signatures** (embedded in blob); the contract may also contain an internal `signatures` section which is a protocol-level concept that requires canonical signing rules to evaluate.
